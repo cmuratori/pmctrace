@@ -1,0 +1,38 @@
+#include <windows.h>
+#include "pmctrace.h"
+
+#ifdef _WIN32
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
+#endif
+
+101 ICON DISCARDABLE "pmctrace_server.ico"
+
+1 VERSIONINFO LOADONCALL MOVEABLE DISCARDABLE IMPURE
+FILEVERSION PMCTRACE_VERSION,0,0,0
+PRODUCTVERSION PMCTRACE_VERSION,0,0,0
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0
+FILETYPE 1
+{
+    BLOCK "StringFileInfo"
+    {
+        BLOCK "040904E4"
+        {
+            VALUE "CompanyName", "None" "\000"
+            VALUE "FileDescription", "Run as administrator to provide PMC access to non-admin EXEs." "\000"
+            VALUE "FileVersion", PMCTRACE_VERSION_STRING "\000"
+            VALUE "LegalCopyright", "Copyright 2024 by Molly Rocket, Inc." "\000"
+            VALUE "LegalTrademarks", "None" "\000"
+            VALUE "ProductName", "PMCTrace Server" "\000"
+            VALUE "ProductVersion", PMCTRACE_VERSION_STRING "\000"
+            VALUE "BuildType", "Default" "\000"
+            VALUE "Comments", "None" "\000"
+        }
+    }
+
+    BLOCK "VarFileInfo"
+    {
+        VALUE "Translation", 0x409, 1252
+    }
+}

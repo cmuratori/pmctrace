@@ -10,58 +10,35 @@
    
    ======================================================================== */
 
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <intrin.h>
 #include <windows.h>
-#include <psapi.h>
-#include <evntrace.h>
-#include <evntcons.h>
 
-#pragma comment (lib, "advapi32.lib")
-
-typedef uint8_t u8;
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-typedef int32_t b32;
-
-typedef float f32;
-typedef double f64;
-
-#define ArrayCount(Array) (sizeof(Array)/sizeof((Array)[0]))
-
+#define PMCTRACE_INCLUDE_IMPLEMENTATION 1
 #include "pmctrace.h"
-#include "pmctrace.cpp"
+#include "pmctrace_counters.h"
 
 extern "C" void CountNonZeroesWithBranch(u64 Count, u8 *Data);
 #pragma comment (lib, "pmctrace_test_asm")
 
+#define TEST_BATCH_SIZE 32
+
 struct thread_context
 {
-    HANDLE ThreadHandle;
-    
-    pmc_tracer *Tracer;
+    pmctrace_client *Tracer;
     
     u64 BufferCount;
     u64 NonZeroCount;
     
-    pmc_trace_result BestResult;
-
-    // NOTE(casey): The scratch space is in the thread_context rather than on the thread's stack
-    // because if there is an error, the thread may exit before the tracer is finished writing back
-    // results, which would lead to a crash - so the scratch targets must remain valid until after
-    // the tracer's receiver thread exits.
-    pmc_traced_region ScratchResults[32];
+    pmctrace_result BestResult;
+    
+    u32 BaseRegionIndex;
 };
 
 static DWORD CALLBACK TestThread(void *Arg)
 {
     thread_context *Context = (thread_context *)Arg;
-    pmc_tracer *Tracer = Context->Tracer;
+    pmctrace_client *Tracer = Context->Tracer;
     
     u64 BufferCount = Context->BufferCount;
     u64 NonZeroCount = Context->NonZeroCount;
@@ -79,18 +56,18 @@ static DWORD CALLBACK TestThread(void *Arg)
         Context->BestResult.TSCElapsed = (u64)-1ll;
         for(u32 Iteration = 0; NoErrors(Tracer) && (Iteration < 10); ++Iteration)
         {
-            u32 BatchSize = ArrayCount(Context->ScratchResults);
-            for(u32 BatchIndex = 0; NoErrors(Tracer) && (BatchIndex < BatchSize); ++BatchIndex)
+            for(u32 BatchIndex = 0; NoErrors(Tracer) && (BatchIndex < TEST_BATCH_SIZE); ++BatchIndex)
             {
-                pmc_traced_region *TracedThread = &Context->ScratchResults[BatchIndex];
-                StartCountingPMCs(Tracer, TracedThread);
+                u32 RegionIndex = Context->BaseRegionIndex + BatchIndex;
+                PMCTraceBeginRegion(Tracer, RegionIndex);
                 CountNonZeroesWithBranch(BufferCount, BufferData);
-                StopCountingPMCs(Tracer, TracedThread);
+                PMCTraceEndRegion(Tracer, RegionIndex);
             }
             
-            for(u32 BatchIndex = 0; BatchIndex < BatchSize; ++BatchIndex)
+            for(u32 BatchIndex = 0; BatchIndex < TEST_BATCH_SIZE; ++BatchIndex)
             {
-                pmc_trace_result Result = GetOrWaitForResult(Tracer, &Context->ScratchResults[BatchIndex]);
+                u32 RegionIndex = Context->BaseRegionIndex + BatchIndex;
+                pmctrace_result Result = PMCTraceGetOrWaitForResult(Tracer, RegionIndex);
                 if(NoErrors(Tracer) && (Context->BestResult.TSCElapsed > Result.TSCElapsed))
                 {
                     Context->BestResult = Result;
@@ -108,69 +85,62 @@ static DWORD CALLBACK TestThread(void *Arg)
 
 int main(void)
 {
-    printf("Looking for PMC names...\n");
-    pmc_name_array SharedNameArray =
+    pmctrace_pmc_definition_array PMCDefs =
     {
-        L"TotalIssues",
-        L"BranchInstructions",
-        L"BranchMispredictions",
+        {
+            PMCTrace_RETIRED_BR_INST,
+            PMCTrace_RETIRED_BR_INST_MISP,
+            PMCTrace_CYCLES_NOT_IN_HALT,
+        }
     };
     
-    pmc_name_array *UsedNames = &SharedNameArray;
-    pmc_source_mapping PMCMapping = MapPMCNames(&SharedNameArray);
-    if(IsValid(&PMCMapping))
+    printf("Starting trace...\n");
+    pmctrace_client Tracer = PMCTraceStartTracing(PMCDefs);
+    
+    thread_context Threads[16] = {};
+    //thread_context Threads[2] = {};
+    HANDLE ThreadHandles[ArrayCount(Threads)] = {};
+    
+    printf("Launching threads...\n");
+    for(u32 ThreadIndex = 0; ThreadIndex < ArrayCount(ThreadHandles); ++ThreadIndex)
     {
-        pmc_tracer Tracer;
+        thread_context *Thread = Threads + ThreadIndex;
+        Thread->Tracer = &Tracer;
+        Thread->BufferCount = 64*1024*1024;
+        Thread->NonZeroCount = ThreadIndex*8192;
+        Thread->BaseRegionIndex = ThreadIndex*10*TEST_BATCH_SIZE;
         
-        printf("Starting trace...\n");
-        StartTracing(&Tracer, &PMCMapping);
+        ThreadHandles[ThreadIndex] = CreateThread(0, 0, TestThread, Thread, 0, 0);
+    }
+    
+    printf("Waiting for threads to complete...\n");
+    WaitForMultipleObjects(ArrayCount(Threads), ThreadHandles, TRUE, INFINITE);
         
-        thread_context Threads[16] = {};
-        HANDLE ThreadHandles[ArrayCount(Threads)] = {};
-        
-        printf("Launching threads...\n");
+    if(NoErrors(&Tracer))
+    {
         for(u32 ThreadIndex = 0; ThreadIndex < ArrayCount(ThreadHandles); ++ThreadIndex)
         {
             thread_context *Thread = Threads + ThreadIndex;
-            Thread->Tracer = &Tracer;
-            Thread->BufferCount = 64*1024*1024;
-            Thread->NonZeroCount = ThreadIndex*8192;
+            pmctrace_result BestResult = Thread->BestResult;
             
-            ThreadHandles[ThreadIndex] = CreateThread(0, 0, TestThread, Thread, 0, 0);
-        }
-
-        printf("Waiting for threads to complete...\n");
-        WaitForMultipleObjects(ArrayCount(Threads), ThreadHandles, TRUE, INFINITE);
-        
-        if(NoErrors(&Tracer))
-        {
-            for(u32 ThreadIndex = 0; ThreadIndex < ArrayCount(ThreadHandles); ++ThreadIndex)
+            printf("\nTHREAD %u - %llu non-zeroes:\n", ThreadIndex, Thread->NonZeroCount);
+            printf("  %llu TSC elapsed / %llu iterations [%u switch%s]\n",
+                   BestResult.TSCElapsed, Thread->BufferCount, BestResult.ContextSwitchCount,
+                   (BestResult.ContextSwitchCount != 1) ? "es" : "");
+            for(u32 CI = 0; CI < BestResult.PMCCount; ++CI)
             {
-                thread_context *Thread = Threads + ThreadIndex;
-                pmc_trace_result BestResult = Thread->BestResult;
-                
-                printf("\nTHREAD %u - %llu non-zeroes:\n", ThreadIndex, Thread->NonZeroCount);
-                printf("  %llu TSC elapsed / %llu iterations [%llu switch%s]\n",
-                       BestResult.TSCElapsed, Thread->BufferCount, BestResult.ContextSwitchCount,
-                       (BestResult.ContextSwitchCount != 1) ? "es" : "");
-                for(u32 CI = 0; CI < BestResult.PMCCount; ++CI)
-                {
-                    printf("  %llu %S\n", BestResult.Counters[CI], UsedNames->Strings[CI]);
-                }
+                printf("  %llu %s\n", BestResult.Counters[CI], PMCDefs.Defs[CI].PrintableName);
             }
         }
-        else
-        {
-            printf("ERROR: %s\n", GetErrorMessage(&Tracer));
-            printf("LOG:\n%s\n", GetDebugLog(&Tracer));
-        }
-        
-        StopTracing(&Tracer);
     }
     else
     {
-        printf("ERROR: Unable to find suitable ETW PMCs\n");
+        printf("CLIENT ERROR: %s\n", GetClientErrorMessage(&Tracer));
+        printf("SERVER ERROR: %s\n", GetServerErrorMessage(&Tracer));
     }
+    
+    printf("Stopping trace...\n");
+    PMCTraceStopPMCTracing(&Tracer);
     
     return 0;
 }

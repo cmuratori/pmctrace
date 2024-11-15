@@ -10,65 +10,321 @@
    
    ======================================================================== */
 
+#if !defined(PMCTRACE_VERSION)
+
 //
 // NOTE(casey): Interface
 //
 
-// NOTE(casey): This MAX is conservative. In practice, the CPU usually allows fewer PMC counters.
-#define MAX_TRACE_PMC_COUNT 8
+#include <stdint.h>
 
-struct pmc_name_array
+#define PMCTRACE_VERSION 1
+#define PMCTRACE_VERSION_STRING "1"
+
+#define PMCTRACE_MAX_PMC_COUNT 8
+#define PMCTRACE_MAX_REGION_COUNT 65536
+#define PMCTRACE_MAX_ERROR_LENGTH 256
+
+#pragma pack(push, 1)
+enum pmctrace_pmc_flag
 {
-    wchar_t const *Strings[MAX_TRACE_PMC_COUNT];
+    PMCTrace_Intel_Invert = (1 << 0),
+    PMCTrace_Intel_EdgeDetect = (1 << 1),
+    PMCTrace_Intel_AnyThread = (1 << 2), // TODO(casey): I assume this actually works backwards through ETW, so it should probably be called "OnlyThread" or something?
+    PMCTrace_ARM_AllowHalt = (1 << 3),
 };
-
-struct pmc_source_mapping
+typedef struct pmctrace_pmc_definition
 {
-    u32 SourceIndex[MAX_TRACE_PMC_COUNT];
-    u32 PMCCount;
-    b32 Valid;
-};
-
-struct pmc_trace_result
-{
-    u64 Counters[MAX_TRACE_PMC_COUNT];
+    char const *PrintableName; // NOTE(casey): This is not used by the tracer, it is solely for the user's convenience
     
-    u64 TSCElapsed;
-    u64 ContextSwitchCount;
-    u32 PMCCount;
-    b32 Completed;
-};
+    uint32_t Event;
+    uint32_t Unit;
+    uint32_t CounterMask;
+    uint32_t Flags; // NOTE(casey): Combination of values from pmctrace_pmc_flag
 
-struct pmc_traced_region
+    uint32_t Interval; // NOTE(casey): If left as 0, will be automatically filled in to a default value
+} pmctrace_pmc_definition;
+
+typedef struct pmctrace_pmc_definition_array
 {
-    pmc_trace_result Results;
-    pmc_traced_region *Next;
-    u32 OnThreadID;
-};
+    pmctrace_pmc_definition Defs[PMCTRACE_MAX_PMC_COUNT];
+} pmctrace_pmc_definition_array;
 
-struct pmc_tracer;
+typedef struct pmctrace_result
+{
+    uint64_t Counters[PMCTRACE_MAX_PMC_COUNT];
+    
+    uint64_t TSCElapsed;
+    uint32_t ContextSwitchCount;
+    uint16_t Reserved;
+    uint8_t PMCCount;
+    volatile int8_t Completed;
+} pmctrace_result;
+#pragma pack(pop)
 
-// NOTE(casey): Although MapPMCNames can take an array of up to MAX_TRACE_PMC_COUNT entries, the underlying CPU
-// imposes its own limits, so the mapping may fail if you try to use more names than the CPU supports. It's best
-// to use 4 or less names for compatibility, although some CPUs will allow more.
-static b32 IsValid(pmc_source_mapping *Mapping);
-static pmc_source_mapping MapPMCNames(pmc_name_array *SourceNames);
+#endif
 
-static b32 NoErrors(pmc_tracer *Tracer);
-static char const *GetErrorMessage(pmc_tracer *Tracer);
+//
+// NOTE(casey): Implementation
+//
 
-// NOTE(casey): By default, no debug log is kept, so GetDebugLog will return 0. To enable logging, you must
-// build with PMC_DEBUG_LOG defined to 1.
-static char const *GetDebugLog(pmc_tracer *Tracer);
+#if PMCTRACE_INCLUDE_IMPLEMENTATION
 
-static void StartTracing(pmc_tracer *Tracer, pmc_source_mapping *Mapping);
-static void StopTracing(pmc_tracer *Tracer);
+#pragma warning(disable:4505)
+#pragma warning(disable:4668)
+#pragma warning(disable:5220)
+#pragma warning(disable:5045)
+#pragma warning(disable:4820)
+#pragma warning(disable:4710)
+#pragma warning(disable:4711)
 
-static void StartCountingPMCs(pmc_tracer *Tracer, pmc_traced_region *ResultDest);
-static void StopCountingPMCs(pmc_tracer *Tracer, pmc_traced_region *ResultDest);
+#define UNICODE 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <intrin.h>
 
-// NOTE(casey): Region results can be read as soon as IsComplete returns true. GetOrWaitForResult will read results
-// instantly if they are complete, so if you already know the results are complete via IsComplete, you can call
-// GetOrWaitForResult to retrieve the results without waiting - it only waits when the results are incomplete.
-static b32 IsComplete(pmc_traced_region *Region);
-static pmc_trace_result GetOrWaitForResult(pmc_tracer *Tracer, pmc_traced_region *Region);
+#include <windows.h>
+#include <psapi.h>
+#include <evntrace.h>
+#include <strsafe.h>
+
+#pragma comment (lib, "advapi32")
+#pragma comment (lib, "user32")
+
+typedef uint8_t u8;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+typedef int32_t b32;
+
+typedef float f32;
+typedef double f64;
+
+ // NOTE(casey): This is a stronger memory barrier than necessary, but should not be harmful
+#define MEMORY_FENCE _mm_mfence()
+
+#define ArrayCount(Array) (sizeof(Array)/sizeof((Array)[0]))
+#define function static
+
+#define PMCTRACE_SHARED_MEMORY_NAME_PREFIX L"PMCTraceSharedMemory_"
+
+#define PMCTRACE_SERVER_WINDOW_CLASS L"PMCTraceServerWindowClass"
+#define PMCTRACE_SERVER_WM_START_TRACE (WM_USER + 1)
+#define PMCTRACE_SERVER_WM_END_TRACE (WM_USER + 2)
+#define PMCTRACE_SERVER_WM_TRAY_CLICK (WM_USER + 3)
+
+typedef struct pmctrace_shared_memory
+{
+    volatile u64 ClientVersion;
+    volatile u64 ServerVersion;
+ 
+    // NOTE(casey): Client-provided information filled at creation
+    u64 ProcessID;
+    pmctrace_pmc_definition_array RequestedPMCs;
+    
+    // NOTE(casey): Server-provided information filled as-ready
+    volatile u64 TraceHandle;
+    volatile b32 ServerSideError;
+    char ServerSideErrorMessage[PMCTRACE_MAX_ERROR_LENGTH];
+    pmctrace_result Results[PMCTRACE_MAX_REGION_COUNT];
+} pmctrace_shared_memory;
+
+typedef enum pmctrace_region_operation 
+{
+    PMCTraceOp_None,
+    
+    PMCTraceOp_BeginRegion,
+    PMCTraceOp_EndRegion,
+    
+    PMCTraceOp_Count,
+} pmctrace_region_operation;
+
+typedef struct pmctrace_etw_marker_userdata
+{
+    u64 ClientUniqueID;
+    u32 DestRegionIndex;
+    u32 Reserved;
+} pmctrace_etw_marker_userdata;
+
+typedef struct pmctrace_client
+{
+    u64 UniqueID;
+    
+    HANDLE SharedMapping;
+    pmctrace_shared_memory *Shared;
+    
+    TRACEHANDLE TraceHandle;
+    b32 ClientSideError;
+    u32 Reserved;
+
+    char ClientSideErrorMessage[PMCTRACE_MAX_ERROR_LENGTH];
+    pmctrace_result ErrorResult;
+} pmctrace_client;
+
+typedef struct pmctrace_etw_marker
+{
+    EVENT_TRACE_HEADER Header;
+    pmctrace_etw_marker_userdata UserData;
+} pmctrace_etw_marker;
+
+static const GUID TraceMarkerCategoryGuid = {0x5c96d7f7, 0xb1ea, 0x4fbe, {0x86, 0x55, 0xe0, 0x43, 0x1e, 0x23, 0x2e, 0x53}};
+
+function void TraceError(pmctrace_client *Client, char *Message)
+{
+    Client->ClientSideError = 1;
+    wsprintfA(Client->ClientSideErrorMessage, "%s", Message);
+}
+
+function b32 PMCTraceResultIsComplete(pmctrace_result *RegionResult)
+{
+    b32 Result = RegionResult->Completed;
+    return Result;
+}
+
+function b32 NoErrors(pmctrace_client *Client)
+{
+    b32 Result = (!Client->ClientSideError && !Client->Shared->ServerSideError);
+    return Result;
+}
+
+function char *GetClientErrorMessage(pmctrace_client *Client)
+{
+    char *Result = Client->ClientSideErrorMessage;
+    return Result;
+}
+
+function char *GetServerErrorMessage(pmctrace_client *Client)
+{
+    char *Result = "";
+    if(Client->Shared)
+    {
+        Result = Client->Shared->ServerSideErrorMessage;
+    }
+    
+    return Result;
+}
+
+function void SendServerMessage(pmctrace_client *Client, UINT Message, LPARAM Param)
+{
+    HWND ServerWindow = FindWindowW(PMCTRACE_SERVER_WINDOW_CLASS, 0);
+    if(IsWindow(ServerWindow))
+    {
+        SendMessageW(ServerWindow, Message, Client->UniqueID, Param);
+    }
+    else
+    {
+        TraceError(Client, "Unable to find server window");
+    }
+}
+
+function pmctrace_client PMCTraceStartTracing(pmctrace_pmc_definition_array RequestedPMCs)
+{
+    pmctrace_client Client = {};
+    
+    u32 MapSize = sizeof(pmctrace_shared_memory);
+    Client.UniqueID = __rdtsc();
+    
+    wchar_t SharedName[256];
+    StringCbPrintfW(SharedName, sizeof(SharedName), PMCTRACE_SHARED_MEMORY_NAME_PREFIX "%016llx", Client.UniqueID);
+    Client.SharedMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, 0, PAGE_READWRITE, 0, MapSize, SharedName);
+    Client.Shared = (pmctrace_shared_memory *)MapViewOfFile(Client.SharedMapping, FILE_MAP_ALL_ACCESS, 0, 0, MapSize);
+    if(Client.Shared)
+    {
+        Client.Shared->ClientVersion = PMCTRACE_VERSION;
+        Client.Shared->ProcessID = GetCurrentProcessId();
+        Client.Shared->RequestedPMCs = RequestedPMCs;
+        SendServerMessage(&Client, PMCTRACE_SERVER_WM_START_TRACE, (LPARAM)Client.Shared);
+        Client.TraceHandle = Client.Shared->TraceHandle;
+    }
+    else
+    {
+        TraceError(&Client, "Unable to allocate shared memory");
+    }
+    
+    return Client;
+}
+
+function void PMCTraceStopPMCTracing(pmctrace_client *Client)
+{
+    SendServerMessage(Client, PMCTRACE_SERVER_WM_END_TRACE, 0);
+    
+    if(Client->Shared)
+    {
+        UnmapViewOfFile(Client->Shared);
+    }
+    
+    if(Client->SharedMapping)
+    {
+        CloseHandle(Client->SharedMapping);
+    }
+    
+    pmctrace_client Clear = {};
+    *Client = Clear;
+}
+
+function void PMCTraceRegionOp(pmctrace_client *Client, pmctrace_region_operation Op, u32 RegionIndex)
+{
+    if(Client->Shared)
+    {
+        pmctrace_etw_marker TraceMarker = {};
+        
+        TraceMarker.Header.Size = sizeof(TraceMarker);
+        TraceMarker.Header.Flags = WNODE_FLAG_TRACED_GUID;
+        TraceMarker.Header.Guid = TraceMarkerCategoryGuid;
+        TraceMarker.Header.Class.Type = (u8)Op;
+        
+        TraceMarker.UserData.ClientUniqueID = Client->UniqueID;
+        TraceMarker.UserData.DestRegionIndex = RegionIndex;
+        
+        if(TraceEvent(Client->TraceHandle, &TraceMarker.Header) != ERROR_SUCCESS)
+        {
+            TraceError(Client, "Unable to insert ETW marker");
+        }
+    }
+}
+
+function pmctrace_result *PMCTraceGetResult(pmctrace_client *Client, u32 RegionIndex)
+{
+    pmctrace_result *Result = &Client->ErrorResult;
+    if(Client->Shared && (RegionIndex < ArrayCount(Client->Shared->Results)))
+    {
+        Result = Client->Shared->Results + RegionIndex;
+    }
+    
+    return Result;
+}
+
+function void PMCTraceBeginRegion(pmctrace_client *Client, u32 RegionIndex)
+{
+    pmctrace_result *Result = PMCTraceGetResult(Client, RegionIndex);
+    Result->Completed = 0;
+    PMCTraceRegionOp(Client, PMCTraceOp_BeginRegion, RegionIndex);
+}
+
+function void PMCTraceEndRegion(pmctrace_client *Client, u32 RegionIndex)
+{
+    PMCTraceRegionOp(Client, PMCTraceOp_EndRegion, RegionIndex);
+}
+
+function pmctrace_result PMCTraceGetOrWaitForResult(pmctrace_client *Client, u32 RegionIndex)
+{
+    pmctrace_result *Result = PMCTraceGetResult(Client, RegionIndex);
+    while(NoErrors(Client) && !PMCTraceResultIsComplete(Result))
+    {
+        /* NOTE(casey): This is a spin-lock loop on purpose, because if there was a Sleep() in here
+           or some other yield, it might cause Windows to demote this region, which we don't want.
+           Ideally, we rarely spin here, because there are enough traces in flight to ensure that,
+           whenever we check for results, there are some waiting, except perhaps at the very end of a
+           batch. */
+        
+        _mm_pause();
+    }
+    
+    MEMORY_FENCE;
+    
+    return *Result;
+}
+
+#endif
+
