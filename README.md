@@ -21,9 +21,6 @@ provide accurate, real-time PMC measurements on a vanilla install of Windows –
 Unfortunately, several unavoidable limitations of the ETW API persist despite our best efforts. Specifically:
 
 * This method requires SysCall event collection, which introduces unnecessary overhead when profiling code that performs a lot of actual system calls. This is not an issue for microbenchmarking runs, but could be prohibitive for inline profiling of full applications.
-* You have to run as administrator. Sadly, there is no policy option on Windows that will allow a regular user to access the PMCs.
-* For no obvious reason, Intel CPUs do not provide most of their PMCs via ETW. You can only collect a fraction of the statistics you would get if you had real Intel PMC access.
-* Although AMD CPUs provide a large number of their PMCs via ETW, they notably fail to include one of the most important – a core cycle counter – making microbenchmarking with this method much more cumbersome than it otherwise would be. The user will have to do their own rdpru separately, and it will not track properly across context switches.
 * Unlike rdpmc, results have some latency, so users who don't want to stall must write their code to poll rather than block
 
 # Special Thanks
