@@ -19,9 +19,9 @@ CountNonZeroesWithBranch:
     xor r10, r10
 
 .loop:
-    mov al, [rdx + r10]
+    mov r11b, [rdx + r10]
     
-    cmp al, 0
+    cmp r11b, 0
     jz .skipsum
     inc rax
 .skipsum:
