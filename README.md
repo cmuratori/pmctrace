@@ -7,11 +7,12 @@ After much blood, sweat, and tears – both mine and Mārtiņš Možeiko's (see 
 Based on the ETW API documentation alone, one would think it impossible to have "rdpmc"-style access to PMCs on Windows. However, if you combine custom events with some careful abuse of DPC tracing, it turns out you _can_ make it work. It is still way more code – and way more overhead – than would have been necessary were the ETW API sane, but, at least we have now proven it's _possible_ to have PMC collection markup like this:
 
 ```
-    pmc_traced_region Region;
-
-    StartCountingPMCs(Tracer, &Region);
-    // ... any code you want to measure goes here ...
-    StopCountingPMCs(Tracer, &Region);
+    PMCTraceBeginRegion(&Tracer, 0);
+    printf("... This printf is measured only by Region[0].\n");
+    PMCTraceBeginRegion(&Tracer, 1);
+    printf("... This printf is measured by both.\n");
+    PMCTraceEndRegion(&Tracer, 0);
+    PMCTraceEndRegion(&Tracer, 1);
 ```
 
 provide accurate, real-time PMC measurements on a vanilla install of Windows – no third-party kernel drivers required. It works properly with multiple regions, across multiple threads, and returns results directly to the program while it's running.
